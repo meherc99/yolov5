@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 
 import cv2
-import torch
+import torch, torchvision
 import torch.backends.cudnn as cudnn
 
 from models.experimental import attempt_load
@@ -15,7 +15,7 @@ from utils.torch_utils import select_device, load_classifier, time_synchronized
 
 
 def detect(opt):
-    source, weights, view_img, save_txt, imgsz = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size
+    source, weight_near, weight_far, view_img, save_txt, imgsz = opt.source, opt.weight_near, opt.weight_far, opt.view_img, opt.save_txt, opt.img_size
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
         ('rtsp://', 'rtmp://', 'http://', 'https://'))
@@ -30,12 +30,15 @@ def detect(opt):
     half = device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
+    model_far = attempt_load(weight_far, map_location=device)  # load FP32 model
+    model_near = attempt_load(weight_near, map_location=device)  # load FP32 model
+    stride = int(model_near.stride.max())  # model stride
+
     imgsz = check_img_size(imgsz, s=stride)  # check img_size
-    names = model.module.names if hasattr(model, 'module') else model.names  # get class names
+    names = model_near.module.names if hasattr(model_near, 'module') else model_near.names  # get class names
     if half:
-        model.half()  # to FP16
+        model_near.half()  # to FP16
+        model_far.half()  # to FP16
 
     # Second-stage classifier
     classify = False
@@ -54,30 +57,88 @@ def detect(opt):
 
     # Run inference
     if device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+        model_near(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model_near.parameters())))  # run once
+        model_far(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model_far.parameters())))  # run once
+
+    x_lim_upper = 0.75
+    x_lim_lower = 0.25
+    y_lim_upper = 0.6
+    y_lim_lower = 0
+
+    x_delta = x_lim_upper - x_lim_lower
+    y_delta = y_lim_upper - y_lim_lower
+
+    # print(img.shape) : (3, 384, 640)
+    # print(im0s.shape) : (1080, 1920, 3)
+    # print(img_crop.shape) : (3, 448, 640)
+    # print(im_crop0s.shape) : (648, 960, 3)
+
     t0 = time.time()
-    for path, img, im0s, vid_cap in dataset:
+    for path, img, im0s, img_crop, im_crop0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
+        img_crop = torch.from_numpy(img_crop).to(device)
+        img_crop = img_crop.half() if half else img_crop.float()  # uint8 to fp16/32
+        img_crop /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if img_crop.ndimension() == 3:
+            img_crop = img_crop.unsqueeze(0)
+
         # Inference
         t1 = time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+        pred_far = model_far(img_crop, augment=opt.augment)[0]
+        pred_near = model_near(img, augment=opt.augment)[0]
 
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms,
+        pred_far = non_max_suppression(pred_far, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms,
                                    max_det=opt.max_det)
+        pred_near = non_max_suppression(pred_near, opt.conf_thres, opt.iou_thres, opt.classes, opt.agnostic_nms,
+                                   max_det=opt.max_det)
+        
+        # Perform superimposition
+        pred_final=torch.tensor([]).to(device)
+
+        for det in pred_far:
+            # Rescale boxes from img_size to im0 size
+            det[:, :4] = scale_coords(img_crop.shape[2:], det[:, :4], im_crop0s.shape).round()
+
+            # det [x1,y1,x2,y2]        
+            det[:,[0,2]] = det[:,[0,2]] + x_lim_lower*im0s.shape[1]
+            det[:,[1,3]] = det[:,[1,3]] + y_lim_lower*im0s.shape[0]
+            pred_final=torch.cat([pred_final,det])
+          
+
+        for det in pred_near:
+            # Rescale boxes from img_size to im0 size
+            det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0s.shape).round()
+            pred_final=torch.cat([pred_final,det])
+
+
+        pred_final = pred_final.unsqueeze(0)
+
+        output = [torch.zeros((0, 6), device=pred_final.device)] * pred_final.shape[0]
+        for xi, x in enumerate(pred_final):
+            # If none remain process next image
+            if not x.shape[0]:
+                continue
+
+            boxes, scores = x[:, :4], x[:, 4]  # boxes (offset by class), scores
+            i = torchvision.ops.nms(boxes, scores, 0.45)  # NMS
+            output[xi] = x[i]
+
+
         t2 = time_synchronized()
 
         # Apply Classifier
-        if classify:
-            pred = apply_classifier(pred, modelc, img, im0s)
+        # if classify:
+        #     pred_final = apply_classifier(pred_final, modelc, img, im0s)
+
 
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
+        for i, det in enumerate(output):  # detections per image
             if webcam:  # batch_size >= 1
                 p, s, im0, frame = path[i], f'{i}: ', im0s[i].copy(), dataset.count
             else:
@@ -89,10 +150,8 @@ def detect(opt):
             s += '%gx%g ' % img.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if opt.save_crop else im0  # for opt.save_crop
+            
             if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
@@ -149,7 +208,8 @@ def detect(opt):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--weight-far', nargs='+', type=str, default='yolov5m.pt', help='model.pt path(s)')
+    parser.add_argument('--weight-near', nargs='+', type=str, default='yolov5m.pt', help='model.pt path(s)')
     parser.add_argument('--source', type=str, default='data/images', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
@@ -177,8 +237,8 @@ if __name__ == '__main__':
 
     with torch.no_grad():
         if opt.update:  # update all models (to fix SourceChangeWarning)
-            for opt.weights in ['yolov5s.pt', 'yolov5m.pt', 'yolov5l.pt', 'yolov5x.pt']:
+            for opt.weight_near in ['yolov5s.pt', 'yolov5m.pt', 'yolov5l.pt', 'yolov5x.pt']:
                 detect(opt=opt)
-                strip_optimizer(opt.weights)
+                strip_optimizer(opt.weight_near)
         else:
             detect(opt=opt)

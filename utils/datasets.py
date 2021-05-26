@@ -157,6 +157,11 @@ class LoadImages:  # for inference
             raise StopIteration
         path = self.files[self.count]
 
+        x_lim_upper = 0.75
+        x_lim_lower = 0.25
+        y_lim_upper = 0.6
+        y_lim_lower = 0
+
         if self.video_flag[self.count]:
             # Read video
             self.mode = 'video'
@@ -181,14 +186,20 @@ class LoadImages:  # for inference
             assert img0 is not None, 'Image Not Found ' + path
             print(f'image {self.count}/{self.nf} {path}: ', end='')
 
+        img_cropped0 = img0[int(img0.shape[0]*y_lim_lower):int(img0.shape[0]*y_lim_upper),int(img0.shape[1]*x_lim_lower):int(img0.shape[1]*x_lim_upper)]
+        
         # Padded resize
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
+        img_cropped = letterbox(img_cropped0, self.img_size, stride=self.stride)[0]
 
         # Convert
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return path, img, img0, self.cap
+        img_cropped = img_cropped[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img_cropped = np.ascontiguousarray(img_cropped)
+
+        return path, img, img0, img_cropped, img_cropped0, self.cap
 
     def new_video(self, path):
         self.frame = 0
